@@ -1,17 +1,20 @@
 -- flatten.lua : mining turtle clears an area down to its own level and
 -- patches holes in the floor with the stone/dirt it mined.
 --
--- Usage: flatten <length> <width> [height|auto] [left] [nofill]
+-- Usage: flatten <length> <width> [height|auto] [left] [nofill] [skip]
 --   Stand the turtle ON the floor you want (it clears its own level and up),
 --   at one corner, facing along the length. The area goes forward <length>
 --   and to the right <width> (add "left" to go left instead).
 --   height = how many levels to clear (default auto: keeps going up until a
 --   whole layer is empty). Put a chest BEHIND the turtle for it to unload into.
+--   skip = asks for the corners of areas (your base) it must never dig, in
+--   F3 world coordinates, and works around them.
 
 local args = { ... }
 
 local function usage()
-  print("Usage: flatten <length> <width> [height|auto] [left] [nofill]")
+  print("Usage: flatten <length> <width> [height|auto]")
+  print("       [left] [nofill] [skip]")
   print("Stand turtle on the floor level, at a corner,")
   print("facing along the length. Area goes forward and")
   print("to the right. Chest behind it = unload spot.")
@@ -23,12 +26,13 @@ local L, W = tonumber(args[1]), tonumber(args[2])
 if not L or not W or L < 1 or W < 1 then usage() return end
 L, W = math.floor(L), math.floor(W)
 
-local H, AUTO, MIRROR, FILL = 256, true, false, true
+local H, AUTO, MIRROR, FILL, ASKSKIP = 256, true, false, true, false
 for i = 3, #args do
   local a = args[i]:lower()
   if tonumber(a) then H = math.floor(tonumber(a)) AUTO = false
   elseif a == "left" then MIRROR = true
   elseif a == "nofill" then FILL = false
+  elseif a == "skip" then ASKSKIP = true
   elseif a ~= "auto" then usage() return end
 end
 if H < 1 then usage() return end
@@ -45,6 +49,61 @@ local FILLER = {
   ["minecraft:netherrack"] = true, ["minecraft:sandstone"] = true,
   ["minecraft:calcite"] = true, ["minecraft:blackstone"] = true,
 }
+
+-- ---- skip zones (columns it never enters or digs, every level) -------------
+local SKIP = {}   -- { {x1, z1, x2, z2}, ... } in turtle-local coords
+
+local function skipped(cx, cz)
+  for _, r in ipairs(SKIP) do
+    if cx >= r[1] and cx <= r[3] and cz >= r[2] and cz <= r[4] then return true end
+  end
+  return false
+end
+
+local function askXZ(q)
+  while true do
+    write(q .. " ")
+    local a, b = read():match("^%s*(-?%d+)[%s,]+(-?%d+)%s*$")
+    if a then return tonumber(a), tonumber(b) end
+    print("Type two numbers like: 120 -45")
+  end
+end
+
+local function setupSkip()
+  local tx, tz
+  if gps and gps.locate then
+    local gx, _, gz = gps.locate(2)
+    if gx then tx, tz = math.floor(gx), math.floor(gz) print(("GPS: turtle at X %d Z %d"):format(tx, tz)) end
+  end
+  if not tx then tx, tz = askXZ("Turtle's X Z (F3, standing in its spot):") end
+  local FACE = { north = { 0, -1 }, south = { 0, 1 }, east = { 1, 0 }, west = { -1, 0 } }
+  local fv
+  while not fv do
+    write("Which way does the turtle face? (n/s/e/w) ")
+    local a = read():lower()
+    for k, v in pairs(FACE) do if a ~= "" and k:sub(1, #a) == a then fv = v end end
+  end
+  -- side vector = the direction the width goes (right of facing, or left)
+  local sx, sz = -fv[2], fv[1]
+  if MIRROR then sx, sz = -sx, -sz end
+  local function toLocal(wx, wz)
+    local dx, dz = wx - tx, wz - tz
+    return dx * fv[1] + dz * fv[2], dx * sx + dz * sz
+  end
+  repeat
+    print("Skip zone " .. (#SKIP + 1) .. " (it won't dig these columns):")
+    local ax, az = toLocal(askXZ(" Corner 1 X Z:"))
+    local bx, bz = toLocal(askXZ(" Opposite corner X Z:"))
+    local r = { math.min(ax, bx), math.min(az, bz), math.max(ax, bx), math.max(az, bz) }
+    if r[3] < 0 or r[1] >= L or r[4] < 0 or r[2] >= W then
+      print(" That zone is outside the area, ignoring it.")
+    else
+      SKIP[#SKIP + 1] = r
+      print((" OK: %d-%d forward, %d-%d to the side"):format(r[1], r[3], r[2], r[4]))
+    end
+    write("Add another skip zone? (y/n) ")
+  until read():lower():sub(1, 1) ~= "y"
+end
 
 -- position relative to start: x = forward, z = toward the width side, y = up
 -- facing: 0 = +x, 1 = +z, 2 = -x, 3 = -z
@@ -128,14 +187,77 @@ local function clearBelow()
   end
 end
 
--- horizontal first, then vertical, unless we're climbing (so trips home run
--- along the already-cleared level and drop down the start column)
+local function open(cx, cz)
+  return cx >= 0 and cx < L and cz >= 0 and cz < W and not skipped(cx, cz)
+end
+
+-- is the straight L-shaped path (x leg first, or z leg first) clear?
+local function legClear(ax, az, bx, bz, xFirst)
+  local sx = (bx > ax) and 1 or -1
+  local sz = (bz > az) and 1 or -1
+  if xFirst then
+    for cx = ax, bx, sx do if not open(cx, az) then return false end end
+    for cz = az, bz, sz do if not open(bx, cz) then return false end end
+  else
+    for cz = az, bz, sz do if not open(ax, cz) then return false end end
+    for cx = ax, bx, sx do if not open(cx, bz) then return false end end
+  end
+  return true
+end
+
+-- breadth-first path around skip zones; returns list of {x, z} steps
+local function findPath(tx, tz)
+  local function key(cx, cz) return cz * L + cx end
+  local prev, q, head = { [key(x, z)] = false }, { { x, z } }, 1
+  while head <= #q do
+    local c = q[head] head = head + 1
+    if c[1] == tx and c[2] == tz then
+      local path = {}
+      while c do table.insert(path, 1, c) c = prev[key(c[1], c[2])] end
+      table.remove(path, 1)
+      return path
+    end
+    for _, d in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+      local nx, nz = c[1] + d[1], c[2] + d[2]
+      if open(nx, nz) and prev[key(nx, nz)] == nil then
+        prev[key(nx, nz)] = c
+        q[#q + 1] = { nx, nz }
+      end
+    end
+  end
+  return nil
+end
+
+local function stepTo(nx, nz)
+  if nx > x then face(0) elseif nx < x then face(2)
+  elseif nz > z then face(1) else face(3) end
+  fwd()
+end
+
+local function walkTo(tx, tz)
+  if x == tx and z == tz then return end
+  local function legs(xFirst)
+    if xFirst then
+      if x < tx then face(0) while x < tx do fwd() end end
+      if x > tx then face(2) while x > tx do fwd() end end
+    end
+    if z < tz then face(1) while z < tz do fwd() end end
+    if z > tz then face(3) while z > tz do fwd() end end
+    if x < tx then face(0) while x < tx do fwd() end end
+    if x > tx then face(2) while x > tx do fwd() end end
+  end
+  if #SKIP == 0 or legClear(x, z, tx, tz, true) then legs(true) return end
+  if legClear(x, z, tx, tz, false) then legs(false) return end
+  local path = findPath(tx, tz)
+  if not path then error(("No way around the skip zone to %d,%d"):format(tx, tz), 0) end
+  for _, c in ipairs(path) do stepTo(c[1], c[2]) end
+end
+
+-- climb first, walk, then drop (so trips home run along the cleared level
+-- and come down the start column)
 local function goTo(tx, ty, tz)
   while y < ty do up() end
-  if x < tx then face(0) while x < tx do fwd() end end
-  if x > tx then face(2) while x > tx do fwd() end end
-  if z < tz then face(1) while z < tz do fwd() end end
-  if z > tz then face(3) while z > tz do fwd() end end
+  walkTo(tx, tz)
   while y > ty do down() end
 end
 
@@ -279,11 +401,13 @@ local function sweep(lvl, doUp, doDown, doFill)
     local xa, xb = 0, L - 1
     if xdir == -1 then xa, xb = L - 1, 0 end
     for cx = xa, xb, xdir do
+      if not skipped(cx, cz) then
       checkup()
       goTo(cx, lvl, cz)
       if doUp then clearAbove() end
       if doDown then clearBelow() end
       if doFill then fillHole() end
+      end
     end
     xdir = -xdir
     cz = cz + zs
@@ -291,6 +415,25 @@ local function sweep(lvl, doUp, doDown, doFill)
 end
 
 -- ======================================================================
+
+if ASKSKIP then setupSkip() end
+if #SKIP > 0 then
+  if skipped(0, 0) then print("The turtle's own spot is inside a skip zone!") return end
+  local total, seen, q, head = 0, { [0] = true }, { { 0, 0 } }, 1
+  for cx = 0, L - 1 do for cz = 0, W - 1 do if open(cx, cz) then total = total + 1 end end end
+  while head <= #q do
+    local c = q[head] head = head + 1
+    for _, d in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+      local nx, nz = c[1] + d[1], c[2] + d[2]
+      if open(nx, nz) and not seen[nz * L + nx] then seen[nz * L + nx] = true q[#q + 1] = { nx, nz } end
+    end
+  end
+  if #q < total then
+    print("A skip zone cuts the area in two, so I can't")
+    print("reach part of it. Run each side separately.")
+    return
+  end
+end
 
 local passes = 1
 if H > 2 then passes = 1 + math.ceil((H - 2) / 3) end
