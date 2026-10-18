@@ -20,7 +20,7 @@
 -- costs exactly 1 fuel). A turn costs no fuel, so if it was unloaded
 -- mid-turn it asks you which way it's facing.
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -53,6 +53,12 @@ local FILLER = {
   ["minecraft:granite"] = true, ["minecraft:tuff"] = true,
   ["minecraft:netherrack"] = true, ["minecraft:sandstone"] = true,
   ["minecraft:calcite"] = true, ["minecraft:blackstone"] = true,
+}
+
+-- fuel you gave it stays in the turtle when it unloads (logs etc. don't)
+local KEEP_FUEL = {
+  ["minecraft:coal"] = true, ["minecraft:charcoal"] = true,
+  ["minecraft:coal_block"] = true,
 }
 
 -- the job: settings, progress and pose; everything needed to resume
@@ -380,8 +386,9 @@ local function unload()
   local kept = 0
   for s = 1, 16 do
     if turtle.getItemCount(s) > 0 then
-      local keep = false
-      if FILL and isFiller(s) and kept < KEEP_FILLER then
+      local d = turtle.getItemDetail(s)
+      local keep = d ~= nil and KEEP_FUEL[d.name] == true
+      if not keep and FILL and isFiller(s) and kept < KEEP_FILLER then
         keep = true
         kept = kept + turtle.getItemCount(s)
       end
